@@ -4,26 +4,9 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 import torch.optim as optim
 import argparse
-
-
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 10, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(10, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+from models.dpn import *
+import torch.utils.data.distributed
+import horovod.torch as hvd
 
 def get_data_loaders(batch_size, test_batch_size):
 
@@ -41,14 +24,19 @@ def get_data_loaders(batch_size, test_batch_size):
     ])
 
     kwargs = {'num_workers': 4, 'pin_memory': True} if torch.cuda.is_available() else {}
+    train_dataset = datasets.CIFAR10(root='cifar', train=True, download=True,
+                     transform=train_transform)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
     train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='cifar', train=True, download=True,
-                     transform=train_transform),
-        batch_size=batch_size, shuffle=True, **kwargs)
+        train_dataset, batch_size=batch_size, sampler=train_sampler, **kwargs)
+
+    test_dataset = datasets.CIFAR10(root='cifar', train=False, download=True,
+                     transform=test_transform)
+    test_sampler = torch.utils.data.distributed.DistributedSampler(
+        test_dataset, num_replicas=hvd.size(), rank=hvd.rank())
     test_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='cifar', train=False, download=True,
-                     transform=test_transform),
-        batch_size=test_batch_size, shuffle=False, **kwargs)
+        test_dataset, batch_size=test_batch_size, sampler=test_sampler, **kwargs)
 
     return train_loader, test_loader
 
@@ -83,9 +71,11 @@ def test(model, device, test_loader):
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+
+    if hvd.rank() == 0:
+        print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+            test_loss, correct, len(test_loader.dataset),
+            100. * correct / len(test_loader.dataset)))
 
 
 def main():
@@ -109,16 +99,30 @@ def main():
                         help='how many batches to wait before logging training status')
 
     args = parser.parse_args()
+
+    hvd.init()
     torch.manual_seed(args.seed)
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    model = Net().to(device)
-    print(model)
+    if use_cuda:
+        # Horovod: pin GPU to local rank.
+        torch.cuda.set_device(hvd.local_rank())
+        torch.cuda.manual_seed(args.seed)
+
+    model = DPN92().to(device)
     train_loader, test_loader = get_data_loaders(args.batch_size, args.test_batch_size)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # Horovod: broadcast parameters.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+
+    # Horovod: scale learning rate by the number of GPUs.
+    optimizer = optim.Adam(model.parameters(), lr=args.lr * hvd.size())
+
+    # Horovod: wrap optimizer with DistributedOptimizer.
+    optimizer = hvd.DistributedOptimizer(
+        optimizer, named_parameters=model.named_parameters())
 
     for epoch in range(1, args.epochs + 1):
         train(model, device, train_loader, optimizer, epoch)
